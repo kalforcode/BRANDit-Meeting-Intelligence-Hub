@@ -1,15 +1,20 @@
 """
 BRANDit Meeting Intelligence
-Meeting transcription, minutes, action tracking, and Excel reporting
+Meeting transcription, pyannoteAI API speaker diarization, minutes, action tracking, and Excel reporting
 
 Run:
     streamlit run app.py --server.fileWatcherType none
 
-.env / Streamlit secrets:
+Streamlit secrets / .env:
     GROQ_API_KEY=...
-    HF_TOKEN=...
+    PYANNOTE_API_KEY=...
     GROQ_MODEL=llama-3.3-70b-versatile
     WHISPER_MODEL=base
+
+Notes:
+    - Speaker diarization uses pyannoteAI hosted API, not local pyannote.audio.
+    - Transcription still uses Faster-Whisper locally on Streamlit CPU.
+    - FFmpeg is still required to safely convert MP3/MP4/M4A/etc. to WAV.
 """
 
 # ── Windows / OpenMP / Streamlit watcher fixes ───────────────────────────────
@@ -33,19 +38,18 @@ import re
 import shutil
 import subprocess
 import tempfile
-import wave
+import time
+import uuid
 from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
-import torch
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
-from pyannote.audio import Pipeline
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -93,7 +97,7 @@ html,body,[class*="css"]{font-family:Inter,Segoe UI,Arial,sans-serif;}
 .eyebrow{display:inline-flex;align-items:center;gap:8px;background:rgba(32,227,194,.10);border:1px solid rgba(32,227,194,.18);color:var(--teal);border-radius:7px;padding:7px 12px;font-size:.72rem;font-weight:850;letter-spacing:.14em;text-transform:uppercase;margin-bottom:18px;}
 .hero h1{font-size:2.45rem;margin:0 0 12px;color:var(--teal);font-weight:900;letter-spacing:-.04em;}
 .hero p{color:#d9e4ef;margin:0;font-size:1.02rem;line-height:1.65;max-width:850px;}
-.workflow{display:flex;gap:10px;align-items:center;margin:0 0 22px;color:#64748b;font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;}
+.workflow{display:flex;gap:10px;align-items:center;margin:0 0 22px;color:#64748b;font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;flex-wrap:wrap;}
 .workflow span{border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.035);color:#a7b6c9;border-radius:9px;padding:8px 12px;text-transform:none;letter-spacing:0;font-size:.78rem;}
 .workflow .active{background:rgba(32,227,194,.16);border-color:rgba(32,227,194,.32);color:var(--teal);font-weight:800;}
 .card{background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.09);border-radius:16px;padding:20px;margin-bottom:18px;box-shadow:0 12px 32px rgba(0,0,0,.16);}
@@ -127,6 +131,7 @@ html,body,[class*="css"]{font-family:Inter,Segoe UI,Arial,sans-serif;}
 .footer-bar{text-align:center;color:#7d90a8;font-size:.76rem;padding:14px 16px;margin:26px 0 8px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.025);border-radius:14px;}
 .footer-bar b{color:var(--teal);}
 #MainMenu, footer{visibility:hidden;}
+@media(max-width:900px){.metric-strip{grid-template-columns:repeat(2,1fr)}.seg-row{grid-template-columns:60px 95px 1fr}.hero h1{font-size:1.8rem}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -154,9 +159,9 @@ def check_ffmpeg() -> bool:
 
 
 def extract_audio_to_wav(input_path: str, output_path: str) -> None:
-    """Convert uploaded audio/video to mono 16 kHz WAV for stable and faster ASR/diarization."""
+    """Convert uploaded audio/video to mono 16 kHz WAV for stable ASR/API diarization."""
     if not check_ffmpeg():
-        raise RuntimeError("FFmpeg not found. Install FFmpeg and add it to PATH.")
+        raise RuntimeError("FFmpeg not found. Add ffmpeg to packages.txt on Streamlit Cloud.")
 
     cmd = [
         "ffmpeg", "-y",
@@ -179,9 +184,7 @@ def load_whisper(model_size: str, device: str, compute_type: str):
 
 
 def transcribe_fast(path: str, model_size: str, device: str, compute_type: str, language: str = "en") -> dict:
-    """
-    Fast transcription. Word timestamps disabled for speed.
-    """
+    """Fast transcription. Word timestamps disabled for speed."""
     model = load_whisper(model_size, device, compute_type)
 
     segments, info = model.transcribe(
@@ -225,95 +228,210 @@ def transcribe_fast(path: str, model_size: str, device: str, compute_type: str, 
     }
 
 
-# ── pyannote Diarization ─────────────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)
-def load_diarizer(hf_token: str):
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-community-1",
-        token=hf_token,
+# ── pyannoteAI API Diarization ───────────────────────────────────────────────
+PYANNOTE_BASE_URL = "https://api.pyannote.ai/v1"
+
+
+def _pyannote_headers(api_key: str, json_content: bool = True) -> dict:
+    headers = {"Authorization": f"Bearer {api_key}"}
+    if json_content:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def _raise_pyannote_error(response: requests.Response, action: str) -> None:
+    if response.ok:
+        return
+    try:
+        detail = response.json()
+    except Exception:
+        detail = response.text
+    raise RuntimeError(f"pyannoteAI {action} failed ({response.status_code}): {detail}")
+
+
+def upload_audio_to_pyannote_media(wav_path: str, api_key: str) -> str:
+    """
+    Upload local WAV to pyannoteAI temporary media storage.
+    Returns a media:// URL that can be used in the diarize endpoint.
+    """
+    object_key = f"brandit-meetings/{datetime.now().strftime('%Y%m%d')}/{uuid.uuid4().hex}.wav"
+    media_url = f"media://{object_key}"
+
+    create_response = requests.post(
+        f"{PYANNOTE_BASE_URL}/media/input",
+        headers=_pyannote_headers(api_key),
+        json={"url": media_url},
+        timeout=60,
     )
-    if torch.cuda.is_available():
-        pipeline.to(torch.device("cuda"))
-    return pipeline
+    _raise_pyannote_error(create_response, "media URL creation")
+
+    upload_url = create_response.json().get("url")
+    if not upload_url:
+        raise RuntimeError("pyannoteAI did not return a pre-signed upload URL.")
+
+    with open(wav_path, "rb") as audio_file:
+        upload_response = requests.put(
+            upload_url,
+            data=audio_file,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=600,
+        )
+    _raise_pyannote_error(upload_response, "audio upload")
+
+    return media_url
 
 
-def load_wav_mono_tensor(wav_path: str):
-    """
-    Load the FFmpeg-created 16 kHz mono WAV using Python stdlib, not pyannote/TorchCodec.
-    This avoids Windows `AudioDecoder is not defined` errors.
-    Returns waveform tensor with shape [1, num_samples] and sample_rate.
-    """
-    with wave.open(wav_path, "rb") as wf:
-        channels = wf.getnchannels()
-        sample_width = wf.getsampwidth()
-        sample_rate = wf.getframerate()
-        frames = wf.readframes(wf.getnframes())
-
-    if sample_width == 2:
-        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-    elif sample_width == 4:
-        audio = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
-    elif sample_width == 1:
-        audio = (np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
-    else:
-        raise RuntimeError(f"Unsupported WAV sample width: {sample_width} bytes")
-
-    if channels > 1:
-        audio = audio.reshape(-1, channels).mean(axis=1)
-
-    waveform = torch.from_numpy(audio).unsqueeze(0)
-    return waveform, sample_rate
-
-
-def diarize_audio(
-    path: str,
-    hf_token: str,
+def submit_pyannote_diarization_job(
+    media_url: str,
+    api_key: str,
     exact_speakers: Optional[int] = None,
     min_speakers: int = 1,
     max_speakers: int = 6,
-) -> List[dict]:
-    """
-    Return speaker turns: [{start, end, speaker_raw}, ...].
-
-    IMPORTANT: We pass a waveform dictionary to pyannote instead of a file path.
-    New pyannote.audio versions may try to decode file paths with TorchCodec AudioDecoder,
-    which often breaks on Windows. Passing waveform avoids that decoder path.
-    """
-    pipeline = load_diarizer(hf_token)
-
-    waveform, sample_rate = load_wav_mono_tensor(path)
-
-    # Keep model and audio on the same device for pyannote.
-    if torch.cuda.is_available():
-        waveform = waveform.to(torch.device("cuda"))
-
-    audio_input = {
-        "waveform": waveform,
-        "sample_rate": sample_rate,
-        "uri": Path(path).stem,
+    model: str = "precision-2",
+) -> str:
+    """Create a hosted diarization job and return jobId."""
+    payload = {
+        "url": media_url,
+        "model": model,
+        "exclusive": True,
+        "turnLevelConfidence": False,
+        "confidence": False,
+        "transcription": False,
     }
 
     if exact_speakers:
-        output = pipeline(audio_input, num_speakers=int(exact_speakers))
+        payload["numSpeakers"] = int(exact_speakers)
     else:
-        output = pipeline(audio_input, min_speakers=int(min_speakers), max_speakers=int(max_speakers))
+        payload["minSpeakers"] = int(min_speakers)
+        payload["maxSpeakers"] = int(max_speakers)
 
-    annotation = (
-        getattr(output, "exclusive_speaker_diarization", None)
-        or getattr(output, "speaker_diarization", None)
-        or output
+    response = requests.post(
+        f"{PYANNOTE_BASE_URL}/diarize",
+        headers=_pyannote_headers(api_key),
+        json=payload,
+        timeout=60,
+    )
+    _raise_pyannote_error(response, "diarization job creation")
+
+    data = response.json()
+    job_id = data.get("jobId")
+    if not job_id:
+        raise RuntimeError(f"pyannoteAI did not return jobId: {data}")
+    return job_id
+
+
+def poll_pyannote_job(
+    job_id: str,
+    api_key: str,
+    timeout_seconds: int = 1800,
+    sleep_seconds: int = 8,
+    progress_callback=None,
+) -> dict:
+    """Poll pyannoteAI job until terminal status and return full job payload."""
+    start_time = time.time()
+
+    while True:
+        response = requests.get(
+            f"{PYANNOTE_BASE_URL}/jobs/{job_id}",
+            headers=_pyannote_headers(api_key, json_content=False),
+            timeout=60,
+        )
+        _raise_pyannote_error(response, "job polling")
+
+        data = response.json()
+        status = data.get("status", "unknown")
+
+        if progress_callback:
+            progress_callback(status)
+
+        if status == "succeeded":
+            return data
+        if status in {"failed", "canceled"}:
+            raise RuntimeError(f"pyannoteAI diarization job {status}: {data}")
+
+        if time.time() - start_time > timeout_seconds:
+            raise RuntimeError("pyannoteAI diarization timed out. Try a shorter audio file or rerun.")
+
+        time.sleep(sleep_seconds)
+
+
+def _read_time_value(value) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def parse_pyannote_turns(job_payload: dict) -> List[dict]:
+    """
+    Convert pyannoteAI output to the app's format:
+    [{start, end, speaker_raw}, ...]
+    Handles both diarization and exclusiveDiarization shapes.
+    """
+    output = job_payload.get("output", {}) or {}
+    diarization = (
+        output.get("exclusiveDiarization")
+        or output.get("exclusive_diarization")
+        or output.get("diarization")
+        or []
     )
 
-    turns = []
-    for turn, _, speaker in annotation.itertracks(yield_label=True):
+    turns: List[dict] = []
+    for item in diarization:
+        if not isinstance(item, dict):
+            continue
+
+        segment = item.get("segment") if isinstance(item.get("segment"), dict) else {}
+        start = item.get("start", segment.get("start"))
+        end = item.get("end", segment.get("end"))
+        speaker = (
+            item.get("speaker")
+            or item.get("label")
+            or item.get("speakerLabel")
+            or item.get("speaker_label")
+            or "Unknown"
+        )
+
         turns.append({
-            "start": float(turn.start),
-            "end": float(turn.end),
+            "start": _read_time_value(start),
+            "end": _read_time_value(end),
             "speaker_raw": str(speaker),
         })
 
+    turns = [t for t in turns if t["end"] > t["start"]]
     turns.sort(key=lambda x: (x["start"], x["end"]))
     return turns
+
+
+def diarize_audio_with_pyannote_api(
+    wav_path: str,
+    api_key: str,
+    exact_speakers: Optional[int] = None,
+    min_speakers: int = 1,
+    max_speakers: int = 6,
+    model: str = "precision-2",
+    progress_callback=None,
+) -> Tuple[List[dict], dict]:
+    """Upload audio, create diarization job, poll result, parse turns."""
+    media_url = upload_audio_to_pyannote_media(wav_path, api_key)
+    job_id = submit_pyannote_diarization_job(
+        media_url=media_url,
+        api_key=api_key,
+        exact_speakers=exact_speakers,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        model=model,
+    )
+    job_payload = poll_pyannote_job(
+        job_id=job_id,
+        api_key=api_key,
+        progress_callback=progress_callback,
+    )
+    turns = parse_pyannote_turns(job_payload)
+    if not turns:
+        raise RuntimeError("pyannoteAI completed, but no speaker turns were returned.")
+    return turns, job_payload
+
 
 def best_speaker_for_segment(start: float, end: float, turns: List[dict]) -> str:
     best = "Unknown"
@@ -331,7 +449,7 @@ def best_speaker_for_segment(start: float, end: float, turns: List[dict]) -> str
 
 
 def attach_speakers_to_segments(td: dict, turns: List[dict]) -> dict:
-    """Attach raw pyannote labels to Faster-Whisper segments by maximum time overlap."""
+    """Attach pyannoteAI labels to Faster-Whisper segments by maximum time overlap."""
     for seg in td.get("segments", []):
         seg["speaker_raw"] = best_speaker_for_segment(seg["start"], seg["end"], turns)
 
@@ -341,8 +459,7 @@ def attach_speakers_to_segments(td: dict, turns: List[dict]) -> dict:
 
 def normalize_speaker_labels(td: dict) -> dict:
     """
-    Fix labels like first visible speaker being SPEAKER_04.
-    pyannote cluster IDs are arbitrary, so we remap by first appearance:
+    pyannote cluster IDs are arbitrary, so remap by first appearance:
         SPEAKER_04 -> Speaker 01
         SPEAKER_01 -> Speaker 02
     """
@@ -451,7 +568,6 @@ def analyse_with_groq(transcript: str, filename: str, groq_key: str, model_name:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Try extracting the first JSON object from accidental extra text
         match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
         if match:
             return json.loads(match.group(0))
@@ -662,18 +778,25 @@ for key, default in {
 
 # ── Secrets / Environment ────────────────────────────────────────────────────
 GROQ_API_KEY = get_secret("GROQ_API_KEY")
-HF_TOKEN = get_secret("HF_TOKEN")
+PYANNOTE_API_KEY = (
+    get_secret("PYANNOTE_API_KEY")
+    or get_secret("PYANNOTEAI_API_KEY")
+    or get_secret("PYANNOTE_API_TOKEN")
+)
 DEFAULT_GROQ_MODEL = get_secret("GROQ_MODEL", "llama-3.3-70b-versatile")
 DEFAULT_WHISPER_MODEL = get_secret("WHISPER_MODEL", "base")
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 VALID_GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"]
 VALID_WHISPER_MODELS = ["tiny", "base", "small", "medium"]
+VALID_PYANNOTE_MODELS = ["precision-2", "community-1"]
 
 groq_model = DEFAULT_GROQ_MODEL if DEFAULT_GROQ_MODEL in VALID_GROQ_MODELS else "llama-3.3-70b-versatile"
 base_whisper_model = DEFAULT_WHISPER_MODEL if DEFAULT_WHISPER_MODEL in VALID_WHISPER_MODELS else "base"
-device = "cuda" if torch.cuda.is_available() else "cpu"
-compute_type = "float16" if device == "cuda" else "int8"
+
+# Streamlit Cloud is CPU. Keep this CPU-safe.
+device = "cpu"
+compute_type = "int8"
 
 with st.sidebar:
     st.markdown("""
@@ -709,6 +832,7 @@ with st.sidebar:
 
     st.divider()
     enable_diarization = st.checkbox("Create speaker-wise transcript", value=True)
+    pyannote_model = st.selectbox("Speaker diarization model", VALID_PYANNOTE_MODELS, index=0)
     known_count = st.checkbox("I know the number of speakers", value=True)
 
     if known_count:
@@ -722,7 +846,7 @@ with st.sidebar:
     st.divider()
     st.markdown("**Setup Status**")
     st.markdown(f"AI minutes: {'<span class=status-ok>Ready</span>' if GROQ_API_KEY else '<span class=status-bad>Needs setup</span>'}", unsafe_allow_html=True)
-    st.markdown(f"Speaker tracking: {'<span class=status-ok>Ready</span>' if HF_TOKEN else '<span class=status-bad>Needs setup</span>'}", unsafe_allow_html=True)
+    st.markdown(f"Speaker tracking API: {'<span class=status-ok>Ready</span>' if PYANNOTE_API_KEY else '<span class=status-bad>Needs setup</span>'}", unsafe_allow_html=True)
     st.markdown(f"Media upload support: {'<span class=status-ok>Ready</span>' if check_ffmpeg() else '<span class=status-bad>Needs setup</span>'}", unsafe_allow_html=True)
 
     st.divider()
@@ -740,8 +864,8 @@ if "Process" in page:
         Workflow
         <span class="active">01 Upload</span>
         <span>02 Transcribe</span>
-        <span>03 Summarise</span>
-        <span>04 Track Actions</span>
+        <span>03 Identify Speakers</span>
+        <span>04 Summarise</span>
         <span>05 Export</span>
     </div>
     """, unsafe_allow_html=True)
@@ -758,7 +882,7 @@ if "Process" in page:
         st.markdown("""
         <div class="feature-card">
             <h3>Speaker-wise Transcript</h3>
-            <p>Separates conversation flow by speaker so teams can review who said what without manual note-taking.</p>
+            <p>Uses hosted speaker diarization to review who said what without manual note-taking.</p>
         </div>
         """, unsafe_allow_html=True)
     with feature_cols[2]:
@@ -784,11 +908,11 @@ if "Process" in page:
 
         missing = []
         if not GROQ_API_KEY:
-            missing.append("AI minutes setup")
-        if enable_diarization and not HF_TOKEN:
-            missing.append("speaker tracking setup")
+            missing.append("AI minutes setup: GROQ_API_KEY")
+        if enable_diarization and not PYANNOTE_API_KEY:
+            missing.append("speaker tracking setup: PYANNOTE_API_KEY")
         if not check_ffmpeg():
-            missing.append("media processing setup")
+            missing.append("media processing setup: ffmpeg")
 
         run = st.button("Analyze Meeting", disabled=(uploaded is None or bool(missing)))
         if missing:
@@ -800,7 +924,7 @@ if "Process" in page:
             ("01", "Clear meeting summary", "Short executive-level overview for quick review."),
             ("02", "Discussion points and decisions", "Captures what was discussed and what was agreed."),
             ("03", "Owner-wise action points", "Creates tasks with priority, timelines and reminders."),
-            ("04", "Speaker-labelled transcript", "Keeps the meeting record easy to audit and share."),
+            ("04", "Speaker-labelled transcript", "Hosted diarization keeps the meeting record easy to audit and share."),
             ("05", "Excel-ready tracker", "Exports minutes, action items, transcript and follow-ups."),
         ]
         for number, title, desc in deliverables:
@@ -831,14 +955,21 @@ if "Process" in page:
             progress.progress(15, "Creating the transcript...")
             td = transcribe_fast(tmp_wav, whisper_model, device, compute_type, language)
 
+            pyannote_payload = None
             if enable_diarization:
-                progress.progress(45, "Identifying speakers...")
-                turns = diarize_audio(
-                    tmp_wav,
-                    hf_token=HF_TOKEN or "",
+                progress.progress(45, "Uploading audio to speaker tracking API...")
+
+                def api_status(status: str):
+                    progress.progress(55, f"Speaker tracking API status: {status}...")
+
+                turns, pyannote_payload = diarize_audio_with_pyannote_api(
+                    wav_path=tmp_wav,
+                    api_key=PYANNOTE_API_KEY or "",
                     exact_speakers=int(exact_speakers) if exact_speakers else None,
                     min_speakers=int(min_speakers),
                     max_speakers=int(max_speakers),
+                    model=pyannote_model,
+                    progress_callback=api_status,
                 )
                 td = attach_speakers_to_segments(td, turns)
             else:
@@ -849,11 +980,11 @@ if "Process" in page:
                 td["speaker_map_raw_to_clean"] = {}
                 td["full_text"] = build_speaker_transcript(td, use_name=False)
 
-            progress.progress(70, "Generating meeting minutes and action points...")
+            progress.progress(75, "Generating meeting minutes and action points...")
             transcript_for_llm = build_speaker_transcript(td, use_name=False)
             analysis = analyse_with_groq(transcript_for_llm, uploaded.name, GROQ_API_KEY or "", groq_model)
 
-            progress.progress(90, "Preparing the Excel report...")
+            progress.progress(92, "Preparing the Excel report...")
             xlsx = build_excel(analysis, td, uploaded.name)
 
             progress.progress(100, "Analysis complete.")
@@ -867,6 +998,8 @@ if "Process" in page:
                 "xlsx": xlsx,
                 "model": groq_model,
                 "whisper_model": whisper_model,
+                "pyannote_model": pyannote_model,
+                "pyannote_payload": pyannote_payload,
             }
             st.session_state.history.append(session)
             st.session_state.current_session = session
@@ -1052,4 +1185,3 @@ st.markdown("""
     Prepared by <b>Kalpanasingh Chauhan</b> &nbsp; · &nbsp; +91 8850159663 &nbsp; · &nbsp; chauhankalpana2020@gmail.com
 </div>
 """, unsafe_allow_html=True)
-
