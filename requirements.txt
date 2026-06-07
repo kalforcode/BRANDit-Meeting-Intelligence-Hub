@@ -1,0 +1,12 @@
+streamlit
+python-dotenv
+pandas
+numpy
+openpyxl
+faster-whisper
+pyannote.audio
+torch
+torchaudio
+langchain-groq
+langchain-core
+hf_xet
