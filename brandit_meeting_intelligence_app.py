@@ -156,10 +156,10 @@ def check_ffmpeg() -> bool:
 
 def prepare_audio_for_apis(input_path: str, output_path: str) -> None:
     """
-    Convert uploaded audio/video to 16 kHz mono FLAC.
+    Convert uploaded audio/video to small 16 kHz mono MP3.
 
-    This keeps the Streamlit app light: FFmpeg only prepares/compresses audio;
-    transcription and diarization happen through hosted APIs.
+    This keeps Streamlit light and also reduces the chance of Groq 413 errors.
+    Long meetings are still chunked before transcription below.
     """
     if not check_ffmpeg():
         raise RuntimeError("FFmpeg not found. Add ffmpeg to packages.txt on Streamlit Cloud.")
@@ -171,7 +171,8 @@ def prepare_audio_for_apis(input_path: str, output_path: str) -> None:
         "-map", "0:a:0",
         "-ac", "1",
         "-ar", "16000",
-        "-c:a", "flac",
+        "-b:a", "48k",
+        "-f", "mp3",
         output_path,
     ]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -179,8 +180,90 @@ def prepare_audio_for_apis(input_path: str, output_path: str) -> None:
         raise RuntimeError("FFmpeg failed to prepare audio:\n" + result.stderr[-2000:])
 
 
+def get_audio_duration_seconds(audio_path: str) -> float:
+    """Return audio duration using ffprobe."""
+    if not check_ffmpeg():
+        raise RuntimeError("FFmpeg not found. Add ffmpeg to packages.txt on Streamlit Cloud.")
+
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        audio_path,
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise RuntimeError("FFprobe failed to read audio duration:\n" + result.stderr[-1000:])
+
+    try:
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def split_audio_for_groq(
+    audio_path: str,
+    output_dir: str,
+    chunk_seconds: int = 600,
+) -> List[Tuple[str, float]]:
+    """
+    Split audio into small MP3 chunks for Groq Whisper API.
+    Returns [(chunk_path, start_offset_seconds), ...].
+    """
+    duration = get_audio_duration_seconds(audio_path)
+    if duration <= 0:
+        return [(audio_path, 0.0)]
+
+    chunks: List[Tuple[str, float]] = []
+    start = 0.0
+    index = 1
+
+    while start < duration:
+        current_duration = min(float(chunk_seconds), duration - start)
+        chunk_path = os.path.join(output_dir, f"groq_chunk_{index:03d}.mp3")
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start),
+            "-t", str(current_duration),
+            "-i", audio_path,
+            "-vn",
+            "-ac", "1",
+            "-ar", "16000",
+            "-b:a", "48k",
+            "-f", "mp3",
+            chunk_path,
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            raise RuntimeError("FFmpeg failed to split audio:\n" + result.stderr[-2000:])
+
+        chunks.append((chunk_path, start))
+        start += float(chunk_seconds)
+        index += 1
+
+    return chunks
+
+
 # ── Groq Whisper API Transcription ───────────────────────────────────────────
 GROQ_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+
+
+def guess_audio_mime_type(audio_path: str) -> str:
+    extension = Path(audio_path).suffix.lower()
+    if extension == ".mp3":
+        return "audio/mpeg"
+    if extension == ".wav":
+        return "audio/wav"
+    if extension == ".flac":
+        return "audio/flac"
+    if extension == ".m4a":
+        return "audio/mp4"
+    if extension == ".ogg":
+        return "audio/ogg"
+    if extension == ".webm":
+        return "audio/webm"
+    return "application/octet-stream"
 
 
 def _raise_groq_audio_error(response: requests.Response) -> None:
@@ -242,7 +325,7 @@ def transcribe_with_groq_api(
 
     with open(audio_path, "rb") as audio_file:
         files = {
-            "file": (Path(audio_path).name, audio_file, "audio/flac")
+            "file": (Path(audio_path).name, audio_file, guess_audio_mime_type(audio_path))
         }
         response = requests.post(
             GROQ_TRANSCRIPTION_URL,
@@ -293,6 +376,70 @@ def transcribe_with_groq_api(
         "words": [],
         "duration": duration,
         "language": result.get("language", language),
+        "lang_prob": 0,
+    }
+
+
+def transcribe_with_groq_api_chunked(
+    audio_path: str,
+    groq_key: str,
+    model_name: str = "whisper-large-v3-turbo",
+    language: str = "en",
+    max_direct_upload_mb: int = 20,
+    chunk_seconds: int = 600,
+    progress_callback=None,
+) -> dict:
+    """
+    Transcribe audio with Groq. If the file is large/long, split into chunks to avoid 413 errors.
+    The returned segment timestamps are shifted back to the original meeting timeline.
+    """
+    file_size_mb = os.path.getsize(audio_path) / 1024 / 1024
+    duration = get_audio_duration_seconds(audio_path)
+
+    should_chunk = file_size_mb > max_direct_upload_mb or duration > chunk_seconds
+
+    if not should_chunk:
+        if progress_callback:
+            progress_callback("Transcribing audio with Groq API...")
+        return transcribe_with_groq_api(audio_path, groq_key, model_name, language)
+
+    all_segments: List[dict] = []
+    all_text_parts: List[str] = []
+    detected_language = language
+
+    with tempfile.TemporaryDirectory() as chunk_dir:
+        chunks = split_audio_for_groq(audio_path, chunk_dir, chunk_seconds=chunk_seconds)
+        total_chunks = len(chunks)
+
+        for index, (chunk_path, offset) in enumerate(chunks, start=1):
+            if progress_callback:
+                progress_callback(f"Transcribing chunk {index}/{total_chunks} with Groq API...")
+
+            chunk_td = transcribe_with_groq_api(
+                chunk_path,
+                groq_key=groq_key,
+                model_name=model_name,
+                language=language,
+            )
+            detected_language = chunk_td.get("language", detected_language)
+
+            for seg in chunk_td.get("segments", []):
+                shifted = dict(seg)
+                shifted["start"] = float(seg.get("start", 0) or 0) + float(offset)
+                shifted["end"] = float(seg.get("end", 0) or 0) + float(offset)
+                all_segments.append(shifted)
+
+            text = (chunk_td.get("full_text") or "").strip()
+            if text:
+                all_text_parts.append(text)
+
+    all_segments.sort(key=lambda x: (x.get("start", 0), x.get("end", 0)))
+    return {
+        "full_text": " ".join(all_text_parts).strip(),
+        "segments": all_segments,
+        "words": [],
+        "duration": duration or (all_segments[-1]["end"] if all_segments else 0),
+        "language": detected_language,
         "lang_prob": 0,
     }
 
@@ -1048,14 +1195,24 @@ if "Process" in page:
                 f.write(uploaded.read())
                 tmp_input = f.name
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".flac") as f:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
                 tmp_audio = f.name
 
-            progress = st.progress(0, "Preparing the recording...")
+            progress = st.progress(0, "Preparing and compressing the recording...")
             prepare_audio_for_apis(tmp_input, tmp_audio)
 
             progress.progress(15, "Creating the transcript...")
-            td = transcribe_with_groq_api(tmp_audio, GROQ_API_KEY or "", whisper_api_model, language)
+
+            def transcription_status(message: str):
+                progress.progress(20, message)
+
+            td = transcribe_with_groq_api_chunked(
+                tmp_audio,
+                GROQ_API_KEY or "",
+                whisper_api_model,
+                language,
+                progress_callback=transcription_status,
+            )
 
             pyannote_payload = None
             if enable_diarization:
