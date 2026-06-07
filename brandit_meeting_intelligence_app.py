@@ -1,6 +1,6 @@
 """
 BRANDit Meeting Intelligence
-Meeting transcription, pyannoteAI API speaker diarization, minutes, action tracking, and Excel reporting
+Groq API transcription, pyannoteAI API speaker diarization, Groq API minutes, action tracking, and Excel reporting
 
 Run:
     streamlit run app.py --server.fileWatcherType none
@@ -9,12 +9,13 @@ Streamlit secrets / .env:
     GROQ_API_KEY=...
     PYANNOTE_API_KEY=...
     GROQ_MODEL=llama-3.3-70b-versatile
-    WHISPER_MODEL=base
+    WHISPER_API_MODEL=whisper-large-v3-turbo
 
 Notes:
+    - Transcription uses Groq Whisper API, not local Faster-Whisper.
     - Speaker diarization uses pyannoteAI hosted API, not local pyannote.audio.
-    - Transcription still uses Faster-Whisper locally on Streamlit CPU.
-    - FFmpeg is still required to safely convert MP3/MP4/M4A/etc. to WAV.
+    - Groq LLM creates minutes/action points.
+    - FFmpeg is still required only for light audio conversion/compression before API upload.
 """
 
 # ── Windows / OpenMP / Streamlit watcher fixes ───────────────────────────────
@@ -49,15 +50,10 @@ import pandas as pd
 import requests
 import streamlit as st
 from dotenv import load_dotenv
-from faster_whisper import WhisperModel
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-
-from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 
 load_dotenv()
 
@@ -158,8 +154,13 @@ def check_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def extract_audio_to_wav(input_path: str, output_path: str) -> None:
-    """Convert uploaded audio/video to mono 16 kHz WAV for stable ASR/API diarization."""
+def prepare_audio_for_apis(input_path: str, output_path: str) -> None:
+    """
+    Convert uploaded audio/video to 16 kHz mono FLAC.
+
+    This keeps the Streamlit app light: FFmpeg only prepares/compresses audio;
+    transcription and diarization happen through hosted APIs.
+    """
     if not check_ffmpeg():
         raise RuntimeError("FFmpeg not found. Add ffmpeg to packages.txt on Streamlit Cloud.")
 
@@ -167,64 +168,132 @@ def extract_audio_to_wav(input_path: str, output_path: str) -> None:
         "ffmpeg", "-y",
         "-i", input_path,
         "-vn",
+        "-map", "0:a:0",
         "-ac", "1",
         "-ar", "16000",
-        "-f", "wav",
+        "-c:a", "flac",
         output_path,
     ]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
-        raise RuntimeError("FFmpeg failed to extract audio:\n" + result.stderr[-2000:])
+        raise RuntimeError("FFmpeg failed to prepare audio:\n" + result.stderr[-2000:])
 
 
-# ── Faster-Whisper Transcription ─────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)
-def load_whisper(model_size: str, device: str, compute_type: str):
-    return WhisperModel(model_size, device=device, compute_type=compute_type)
+# ── Groq Whisper API Transcription ───────────────────────────────────────────
+GROQ_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 
 
-def transcribe_fast(path: str, model_size: str, device: str, compute_type: str, language: str = "en") -> dict:
-    """Fast transcription. Word timestamps disabled for speed."""
-    model = load_whisper(model_size, device, compute_type)
+def _raise_groq_audio_error(response: requests.Response) -> None:
+    if response.ok:
+        return
+    try:
+        detail = response.json()
+    except Exception:
+        detail = response.text
+    raise RuntimeError(f"Groq Whisper API failed ({response.status_code}): {detail}")
 
-    segments, info = model.transcribe(
-        path,
-        language=language if language != "auto" else None,
-        beam_size=1,
-        best_of=1,
-        patience=1.0,
-        temperature=0.0,
-        vad_filter=True,
-        vad_parameters={
-            "min_silence_duration_ms": 500,
-            "speech_pad_ms": 150,
-        },
-        word_timestamps=False,
-        condition_on_previous_text=False,
-        no_speech_threshold=0.6,
-    )
 
-    seg_list = []
+def _to_plain_dict(value):
+    """Convert Groq/OpenAI SDK-like objects to plain dicts when needed."""
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    return value
+
+
+def transcribe_with_groq_api(
+    audio_path: str,
+    groq_key: str,
+    model_name: str = "whisper-large-v3-turbo",
+    language: str = "en",
+    prompt: str = "Meeting discussion with multiple speakers. Use clear punctuation.",
+) -> dict:
+    """
+    Transcribe audio using Groq's OpenAI-compatible Whisper endpoint.
+
+    Returns the same structure the rest of the app expects:
+    {
+        full_text,
+        segments: [{start, end, text}],
+        words,
+        duration,
+        language,
+        lang_prob
+    }
+    """
+    if not groq_key:
+        raise RuntimeError("GROQ_API_KEY is missing.")
+
+    headers = {"Authorization": f"Bearer {groq_key}"}
+
+    data = {
+        "model": model_name,
+        "response_format": "verbose_json",
+        "temperature": "0",
+        "timestamp_granularities[]": "segment",
+    }
+    if prompt:
+        data["prompt"] = prompt[:900]
+    if language != "auto":
+        data["language"] = language
+
+    with open(audio_path, "rb") as audio_file:
+        files = {
+            "file": (Path(audio_path).name, audio_file, "audio/flac")
+        }
+        response = requests.post(
+            GROQ_TRANSCRIPTION_URL,
+            headers=headers,
+            data=data,
+            files=files,
+            timeout=900,
+        )
+
+    _raise_groq_audio_error(response)
+    result = _to_plain_dict(response.json())
+
+    raw_segments = result.get("segments") or []
+    segments = []
     full_parts = []
 
-    for seg in segments:
-        text = (seg.text or "").strip()
+    for seg in raw_segments:
+        seg = _to_plain_dict(seg)
+        if not isinstance(seg, dict):
+            continue
+        text = (seg.get("text") or "").strip()
         if not text:
             continue
-        seg_list.append({
-            "start": float(seg.start),
-            "end": float(seg.end),
+        start = float(seg.get("start", 0) or 0)
+        end = float(seg.get("end", start) or start)
+        if end <= start:
+            # Keep the segment usable even if the provider omits/duplicates end time.
+            end = start + 0.01
+        segments.append({
+            "start": start,
+            "end": end,
             "text": text,
         })
         full_parts.append(text)
 
+    text = (result.get("text") or "").strip()
+    if not segments and text:
+        segments.append({"start": 0.0, "end": float(result.get("duration", 0) or 0), "text": text})
+        full_parts.append(text)
+
+    duration = float(result.get("duration", 0) or 0)
+    if not duration and segments:
+        duration = float(segments[-1]["end"])
+
     return {
-        "full_text": " ".join(full_parts),
-        "segments": seg_list,
+        "full_text": " ".join(full_parts).strip() or text,
+        "segments": segments,
         "words": [],
-        "duration": float(getattr(info, "duration", 0) or (seg_list[-1]["end"] if seg_list else 0)),
-        "language": getattr(info, "language", language),
-        "lang_prob": round(float(getattr(info, "language_probability", 0) or 0), 3),
+        "duration": duration,
+        "language": result.get("language", language),
+        "lang_prob": 0,
     }
 
 
@@ -249,12 +318,13 @@ def _raise_pyannote_error(response: requests.Response, action: str) -> None:
     raise RuntimeError(f"pyannoteAI {action} failed ({response.status_code}): {detail}")
 
 
-def upload_audio_to_pyannote_media(wav_path: str, api_key: str) -> str:
+def upload_audio_to_pyannote_media(audio_path: str, api_key: str) -> str:
     """
-    Upload local WAV to pyannoteAI temporary media storage.
+    Upload local audio to pyannoteAI temporary media storage.
     Returns a media:// URL that can be used in the diarize endpoint.
     """
-    object_key = f"brandit-meetings/{datetime.now().strftime('%Y%m%d')}/{uuid.uuid4().hex}.wav"
+    extension = Path(audio_path).suffix.lower().lstrip(".") or "flac"
+    object_key = f"brandit-meetings/{datetime.now().strftime('%Y%m%d')}/{uuid.uuid4().hex}.{extension}"
     media_url = f"media://{object_key}"
 
     create_response = requests.post(
@@ -269,7 +339,7 @@ def upload_audio_to_pyannote_media(wav_path: str, api_key: str) -> str:
     if not upload_url:
         raise RuntimeError("pyannoteAI did not return a pre-signed upload URL.")
 
-    with open(wav_path, "rb") as audio_file:
+    with open(audio_path, "rb") as audio_file:
         upload_response = requests.put(
             upload_url,
             data=audio_file,
@@ -404,7 +474,7 @@ def parse_pyannote_turns(job_payload: dict) -> List[dict]:
 
 
 def diarize_audio_with_pyannote_api(
-    wav_path: str,
+    audio_path: str,
     api_key: str,
     exact_speakers: Optional[int] = None,
     min_speakers: int = 1,
@@ -413,7 +483,7 @@ def diarize_audio_with_pyannote_api(
     progress_callback=None,
 ) -> Tuple[List[dict], dict]:
     """Upload audio, create diarization job, poll result, parse turns."""
-    media_url = upload_audio_to_pyannote_media(wav_path, api_key)
+    media_url = upload_audio_to_pyannote_media(audio_path, api_key)
     job_id = submit_pyannote_diarization_job(
         media_url=media_url,
         api_key=api_key,
@@ -449,7 +519,7 @@ def best_speaker_for_segment(start: float, end: float, turns: List[dict]) -> str
 
 
 def attach_speakers_to_segments(td: dict, turns: List[dict]) -> dict:
-    """Attach pyannoteAI labels to Faster-Whisper segments by maximum time overlap."""
+    """Attach pyannoteAI labels to Groq Whisper segments by maximum time overlap."""
     for seg in td.get("segments", []):
         seg["speaker_raw"] = best_speaker_for_segment(seg["start"], seg["end"], turns)
 
@@ -540,28 +610,58 @@ Rules:
 - Be precise and professional.""".format(schema=ESCAPED_SCHEMA)
 
 
+GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+
+def _raise_groq_chat_error(response: requests.Response) -> None:
+    if response.ok:
+        return
+    try:
+        detail = response.json()
+    except Exception:
+        detail = response.text
+    raise RuntimeError(f"Groq chat completion failed ({response.status_code}): {detail}")
+
+
 def analyse_with_groq(transcript: str, filename: str, groq_key: str, model_name: str) -> dict:
-    llm = ChatGroq(
-        api_key=groq_key,
-        model=model_name,
-        temperature=0.1,
-        max_tokens=4096,
+    """Create meeting minutes/action tracker using Groq Chat Completions API."""
+    if not groq_key:
+        raise RuntimeError("GROQ_API_KEY is missing.")
+
+    today = datetime.now().strftime("%d %B %Y")
+    system_prompt = SYSTEM_PROMPT.replace("{{today}}", today).replace("{today}", today)
+    user_prompt = f"Filename: {filename}\n\nSpeaker-labelled transcript:\n{transcript[:18000]}"
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.1,
+        "max_completion_tokens": 4096,
+        "response_format": {"type": "json_object"},
+    }
+
+    response = requests.post(
+        GROQ_CHAT_COMPLETIONS_URL,
+        headers={
+            "Authorization": f"Bearer {groq_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=900,
+    )
+    _raise_groq_chat_error(response)
+
+    data = response.json()
+    raw = (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+        .strip()
     )
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
-        ("human", "Filename: {filename}\n\nSpeaker-labelled transcript:\n{transcript}"),
-    ])
-
-    chain = prompt | llm | StrOutputParser()
-
-    raw = chain.invoke({
-        "today": datetime.now().strftime("%d %B %Y"),
-        "filename": filename,
-        "transcript": transcript[:18000],
-    })
-
-    raw = raw.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
     raw = re.sub(r"\s*```$", "", raw)
 
@@ -784,19 +884,15 @@ PYANNOTE_API_KEY = (
     or get_secret("PYANNOTE_API_TOKEN")
 )
 DEFAULT_GROQ_MODEL = get_secret("GROQ_MODEL", "llama-3.3-70b-versatile")
-DEFAULT_WHISPER_MODEL = get_secret("WHISPER_MODEL", "base")
+DEFAULT_WHISPER_API_MODEL = get_secret("WHISPER_API_MODEL", "whisper-large-v3-turbo")
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 VALID_GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"]
-VALID_WHISPER_MODELS = ["tiny", "base", "small", "medium"]
+VALID_WHISPER_API_MODELS = ["whisper-large-v3-turbo", "whisper-large-v3"]
 VALID_PYANNOTE_MODELS = ["precision-2", "community-1"]
 
 groq_model = DEFAULT_GROQ_MODEL if DEFAULT_GROQ_MODEL in VALID_GROQ_MODELS else "llama-3.3-70b-versatile"
-base_whisper_model = DEFAULT_WHISPER_MODEL if DEFAULT_WHISPER_MODEL in VALID_WHISPER_MODELS else "base"
-
-# Streamlit Cloud is CPU. Keep this CPU-safe.
-device = "cpu"
-compute_type = "int8"
+base_whisper_api_model = DEFAULT_WHISPER_API_MODEL if DEFAULT_WHISPER_API_MODEL in VALID_WHISPER_API_MODELS else "whisper-large-v3-turbo"
 
 with st.sidebar:
     st.markdown("""
@@ -816,16 +912,21 @@ with st.sidebar:
 
     processing_mode = st.selectbox(
         "Processing Mode",
-        ["Balanced", "Fast", "Detailed"],
-        index=0,
-        help="Balanced is recommended for most meeting recordings.",
+        ["Fast API", "Balanced API", "Detailed API"],
+        index=1,
+        help="Fast/Balanced use Groq whisper-large-v3-turbo. Detailed uses whisper-large-v3.",
     )
-    if processing_mode == "Fast":
-        whisper_model = "tiny"
-    elif processing_mode == "Detailed":
-        whisper_model = "small"
+    if processing_mode == "Detailed API":
+        whisper_api_model = "whisper-large-v3"
     else:
-        whisper_model = base_whisper_model
+        whisper_api_model = base_whisper_api_model
+
+    whisper_api_model = st.selectbox(
+        "Transcription Model",
+        VALID_WHISPER_API_MODELS,
+        index=VALID_WHISPER_API_MODELS.index(whisper_api_model) if whisper_api_model in VALID_WHISPER_API_MODELS else 0,
+        help="No local Whisper model is loaded. Transcription runs on Groq API.",
+    )
 
     language_label = st.selectbox("Meeting Language", ["English", "Auto detect"], index=0)
     language = "en" if language_label == "English" else "auto"
@@ -845,7 +946,8 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**Setup Status**")
-    st.markdown(f"AI minutes: {'<span class=status-ok>Ready</span>' if GROQ_API_KEY else '<span class=status-bad>Needs setup</span>'}", unsafe_allow_html=True)
+    st.markdown(f"Groq transcription: {'<span class=status-ok>Ready</span>' if GROQ_API_KEY else '<span class=status-bad>Needs setup</span>'}", unsafe_allow_html=True)
+    st.markdown(f"Groq AI minutes: {'<span class=status-ok>Ready</span>' if GROQ_API_KEY else '<span class=status-bad>Needs setup</span>'}", unsafe_allow_html=True)
     st.markdown(f"Speaker tracking API: {'<span class=status-ok>Ready</span>' if PYANNOTE_API_KEY else '<span class=status-bad>Needs setup</span>'}", unsafe_allow_html=True)
     st.markdown(f"Media upload support: {'<span class=status-ok>Ready</span>' if check_ffmpeg() else '<span class=status-bad>Needs setup</span>'}", unsafe_allow_html=True)
 
@@ -939,21 +1041,21 @@ if "Process" in page:
     if uploaded and run:
         suffix = Path(uploaded.name).suffix or ".tmp"
         tmp_input = None
-        tmp_wav = None
+        tmp_audio = None
 
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
                 f.write(uploaded.read())
                 tmp_input = f.name
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
-                tmp_wav = f.name
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".flac") as f:
+                tmp_audio = f.name
 
             progress = st.progress(0, "Preparing the recording...")
-            extract_audio_to_wav(tmp_input, tmp_wav)
+            prepare_audio_for_apis(tmp_input, tmp_audio)
 
             progress.progress(15, "Creating the transcript...")
-            td = transcribe_fast(tmp_wav, whisper_model, device, compute_type, language)
+            td = transcribe_with_groq_api(tmp_audio, GROQ_API_KEY or "", whisper_api_model, language)
 
             pyannote_payload = None
             if enable_diarization:
@@ -963,7 +1065,7 @@ if "Process" in page:
                     progress.progress(55, f"Speaker tracking API status: {status}...")
 
                 turns, pyannote_payload = diarize_audio_with_pyannote_api(
-                    wav_path=tmp_wav,
+                    audio_path=tmp_audio,
                     api_key=PYANNOTE_API_KEY or "",
                     exact_speakers=int(exact_speakers) if exact_speakers else None,
                     min_speakers=int(min_speakers),
@@ -997,7 +1099,7 @@ if "Process" in page:
                 "analysis": analysis,
                 "xlsx": xlsx,
                 "model": groq_model,
-                "whisper_model": whisper_model,
+                "whisper_api_model": whisper_api_model,
                 "pyannote_model": pyannote_model,
                 "pyannote_payload": pyannote_payload,
             }
@@ -1010,7 +1112,7 @@ if "Process" in page:
         except Exception as e:
             st.error(f"Error: {e}")
         finally:
-            for p in [tmp_input, tmp_wav]:
+            for p in [tmp_input, tmp_audio]:
                 if p and os.path.exists(p):
                     try:
                         os.remove(p)
